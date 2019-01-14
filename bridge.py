@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import paho.mqtt.client as mqtt
-import time
-import re
 import configparser as ConfigParser
 import os
+import re
+import time
+from typing import Union, Any
+
+import paho.mqtt.client as mqtt
 
 # Default configuration
 config = {
@@ -24,129 +26,107 @@ config = {
 }
 
 
-def mqtt_on_connect(client, userdata, flags, rc):
-    """@type client: paho.mqtt.client """
-
+def mqtt_on_connect(client: mqtt, userdata: Any, flags: dict, rc: int):
     print("Connection returned result: " + str(rc))
 
     # Subscribe to CEC commands
+    prefix = config['mqtt']['prefix'] + '/cec'
     client.subscribe([
-        (config['mqtt']['prefix'] + '/cec/cmd', 0),
-        (config['mqtt']['prefix'] + '/cec/+/cmd', 0),
-        (config['mqtt']['prefix'] + '/cec/tx', 0)
+        (prefix + '/cmd', 0),
+        (prefix + '/+/cmd', 0),
+        (prefix + '/tx', 0)
     ])
 
 
-def mqtt_on_message(client, userdata, message):
-    """@type client: paho.mqtt.client """
+def receive_message(topic: str, payload: str):
+    print(f'Command received: {topic} ({payload})')
 
+    if topic == 'cmd':
+        commands = {
+            'mute': cec_client.AudioMute,
+            'unmute': cec_client.AudioUnmute,
+            'voldown': cec_client.VolumeDown,
+            'volup': cec_client.VolumeUp,
+        }
+        if payload not in commands:
+            raise Exception(f'Unknown command ({payload})')
+        commands[payload]()
+        return
+
+    if topic == 'tx':
+        for command in payload.split(','):
+            print(f'Sending raw: {command}')
+            cec_send(command)
+        return
+
+    split = topic.split('/')
+    if split[1] == 'cmd':
+        addr = int(split[0])
+
+        if payload == 'on':
+            cec_send('44:6D', addr)
+            mqtt_send(addr, 'on', True)
+            return
+
+        if payload == 'off':
+            cec_send('36', addr)
+            mqtt_send(addr, 'off', True)
+            return
+
+        raise Exception("Unknown command (%s)" % payload)
+
+
+def mqtt_on_message(client: mqtt, userdata: Any, message: mqtt.MQTTMessage):
     try:
-
-        # Decode topic
-        cmd = message.topic.replace(config['mqtt']['prefix'], '').strip('/')
-        print("Command received: %s (%s)" % (cmd, message.payload))
-
-        split = cmd.split('/')
-
-        if split[0] == 'cec':
-
-            if split[1] == 'cmd':
-
-                action = message.payload.decode()
-
-                if action == 'mute':
-                    cec_client.AudioMute()
-                    return
-
-                if action == 'unmute':
-                    cec_client.AudioUnmute()
-                    return
-
-                if action == 'voldown':
-                    cec_client.VolumeDown()
-                    return
-
-                if action == 'volup':
-                    cec_client.VolumeUp()
-                    return
-
-                raise Exception("Unknown command (%s)" % action)
-
-            if split[1] == 'tx':
-                commands = message.payload.decode().split(',')
-                for command in commands:
-                    print(" Sending raw: %s" % command)
-                    cec_send(command)
-                return
-
-            if split[2] == 'cmd':
-
-                action = message.payload.decode()
-
-                if action == 'on':
-                    id = int(split[1])
-                    cec_send('44:6D', id=id)
-                    mqtt_send(config['mqtt']['prefix'] + '/cec/' + str(id), 'on', True)
-                    return
-
-                if action == 'off':
-                    id = int(split[1])
-                    cec_send('36', id=id)
-                    mqtt_send(config['mqtt']['prefix'] + '/cec/' + str(id), 'off', True)
-                    return
-
-                raise Exception("Unknown command (%s)" % action)
-
+        cmd = message.topic.replace(config['mqtt']['prefix'] + '/cec', '').strip('/')
+        payload = message.payload.decode()
+        receive_message(cmd, payload)
     except Exception as e:
         print("Error during processing of message: ", message.topic, message.payload, str(e))
 
 
-def mqtt_send(topic, value, retain=False):
-    mqtt_client.publish(topic, value, retain=retain)
+def mqtt_send(topic: Union[str, int], value: str, retain=False):
+    mqtt_client.publish(config['mqtt']['prefix'] + '/cec/' + str(topic), value, retain=retain)
 
 
 def cec_on_message(level, time, message):
-    if level == cec.CEC_LOG_TRAFFIC:
+    if level != cec.CEC_LOG_TRAFFIC:
+        return
 
-        # Send raw command to mqtt
-        m = re.search('>> ([0-9a-f:]+)', message)
-        if m:
-            mqtt_send(config['mqtt']['prefix'] + '/cec/rx', m.group(1))
+    # Send raw command to mqtt
+    m = re.search('>> ([0-9a-f:]+)', message)
+    if m:
+        mqtt_send('rx', m.group(1))
 
-        # Report Power Status
-        m = re.search('>> ([0-9a-f])[0-9a-f]:90:([0-9a-f]{2})', message)
-        if m:
-            id = int(m.group(1), 16)
-            # power = cec_client.PowerStatusToString(int(m.group(2)))
-            if (m.group(2) == '00') or (m.group(2) == '02'):
-                power = 'on'
-            else:
-                power = 'off'
-            mqtt_send(config['mqtt']['prefix'] + '/cec/' + str(id), power, True)
-            return
+    # Report Power Status
+    m = re.search('>> ([0-9a-f])[0-9a-f]:90:([0-9a-f]{2})', message)
+    if m:
+        id = int(m.group(1), 16)
+        # power = cec_client.PowerStatusToString(int(m.group(2)))
+        power = 'on' if (m.group(2) == '00') or (m.group(2) == '02') else 'off'
+        mqtt_send(id, power, True)
+        return
 
-        # Device Vendor ID
-        m = re.search('>> ([0-9a-f])[0-9a-f]:87', message)
-        if m:
-            id = int(m.group(1), 16)
-            power = 'on'
-            mqtt_send(config['mqtt']['prefix'] + '/cec/' + str(id), power, True)
-            return
+    # Device Vendor ID
+    m = re.search('>> ([0-9a-f])[0-9a-f]:87', message)
+    if m:
+        id = int(m.group(1), 16)
+        power = 'on'
+        mqtt_send(id, power, True)
+        return
 
-        # Report Physical Address
-        m = re.search('>> ([0-9a-f])[0-9a-f]:84', message)
-        if m:
-            id = int(m.group(1), 16)
-            power = 'on'
-            mqtt_send(config['mqtt']['prefix'] + '/cec/' + str(id), power, True)
-            return
+    # Report Physical Address
+    m = re.search('>> ([0-9a-f])[0-9a-f]:84', message)
+    if m:
+        id = int(m.group(1), 16)
+        power = 'on'
+        mqtt_send(id, power, True)
+        return
 
 
 def cec_send(cmd, id=None):
-    if id is None:
-        cec_client.Transmit(cec_client.CommandFromString(cmd))
-    else:
-        cec_client.Transmit(cec_client.CommandFromString('1%s:%s' % (hex(id)[2:], cmd)))
+    command = cmd if id is None else f'1{hex(id)[2:]}:{cmd}'
+    cec_client.Transmit(cec_client.CommandFromString(command))
 
 
 def cec_refresh():
@@ -164,9 +144,9 @@ def cleanup():
 
 
 try:
-    ### Parse config ###
+    # Parse config
     try:
-        Config = ConfigParser.SafeConfigParser()
+        Config = ConfigParser.ConfigParser()
         if Config.read("config.ini"):
 
             # Load all sections and overwrite default configuration
@@ -176,7 +156,7 @@ try:
         # Environment variables
         for section in config:
             for key, value in config[section].items():
-                env = os.getenv(section.upper() + '_' + key.upper());
+                env = os.getenv(section.upper() + '_' + key.upper())
                 if env:
                     config[section][key] = type(value)(env)
 
@@ -184,7 +164,7 @@ try:
         print("ERROR: Could not configure:", str(e))
         exit(1)
 
-    ### Setup CEC ###
+    # Setup CEC
     print("Initialising CEC...")
     try:
         import cec
@@ -202,14 +182,13 @@ try:
         print("ERROR: Could not initialise CEC:", str(e))
         exit(1)
 
-
-    ### Setup MQTT ###
+    # Setup MQTT
     print("Initialising MQTT...")
     mqtt_client = mqtt.Client("cec-mqtt")
     mqtt_client.on_connect = mqtt_on_connect
     mqtt_client.on_message = mqtt_on_message
     if config['mqtt']['user']:
-        mqtt_client.username_pw_set(config['mqtt']['user'], password=config['mqtt']['password']);
+        mqtt_client.username_pw_set(config['mqtt']['user'], password=config['mqtt']['password'])
     mqtt_client.connect(config['mqtt']['broker'], int(config['mqtt']['port']), 60)
     mqtt_client.loop_start()
 
