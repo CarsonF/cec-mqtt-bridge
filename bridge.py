@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+import faulthandler; faulthandler.enable()
 
 import configparser as ConfigParser
 import os
@@ -26,8 +27,17 @@ config = {
         'devices': '0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15',
     }
 }
-cec_client: Union[cec.ICECAdapter, None] = None
+cec_client: Union[cec.ICECAdapter, None] = {}
 mqtt_client: Union[mqtt.Client, None] = None
+
+device_type = cec.CEC_DEVICE_TYPE_RECORDING_DEVICE
+# levelStrMap = {
+#     [cec.CEC_LOG_ERROR]: "ERROR"
+#     [cec.CEC_LOG_WARNING]: "WARNING"
+#     [cec.CEC_LOG_NOTICE]: "NOTICE"
+#     [cec.CEC_LOG_TRAFFIC]: "TRAFFIC"
+#     [cec.CEC_LOG_DEBUG]: "DEBUG"
+# }
 
 
 def mqtt_on_connect(client: mqtt, userdata: Any, flags: dict, rc: int):
@@ -104,8 +114,11 @@ def cec_on_source_activated(*args):
 
 def cec_on_message(level, time, message):
     if level != cec.CEC_LOG_TRAFFIC:
-        return
+        return 0
+    if (message.startswith(">>")):
+        print(f"[{time}]\t{message}")
 
+    return 0
     # Send raw command to mqtt
     m = re.search('>> ([0-9a-f:]+)', message)
     if m:
@@ -138,15 +151,18 @@ def cec_on_message(level, time, message):
 
 
 def cec_send(cmd, id=None):
-    command = cmd if id is None else f'1{hex(id)[2:]}:{cmd}'
+    command = cmd if id is None else f'{device_type}{hex(id)[2:]}:{cmd}'
+    command = command.lower()
     print(f'Command: {command}')
-    cec_client.Transmit(cec_client.CommandFromString(command))
+    c = cec_client.CommandFromString(command)
+    cec_client.Transmit(c)
 
 
 def cec_refresh():
     try:
-        for id in config['cec']['devices'].split(','):
-            cec_send('8F', id=int(id))
+        # for id in config['cec']['devices'].split(','):
+            # cec_send('8F', id=int(id))
+        cec_send('8F', 0)
 
     except Exception as e:
         print("Error during refreshing: ", str(e))
@@ -174,34 +190,38 @@ def parse_config():
                 config[section][key] = type(value)(env)
 
 
+def log_callback(level, time, message):
+  return 0
+
 def init_cec():
     cec_config = cec.libcec_configuration()
     cec_config.strDeviceName = "cec-mqtt"
     cec_config.bActivateSource = False
-    cec_config.deviceTypes.Add(cec.CEC_DEVICE_TYPE_PLAYBACK_DEVICE)
+    cec_config.deviceTypes.Add(device_type)
     cec_config.clientVersion = cec.LIBCEC_VERSION_CURRENT
-    cec_config.bAutodetectAddress = True
+    # cec_config.bAutodetectAddress = True
     # cec_config.logicalAddresses.Set(3)
     # cec_config.SetLogCallback(cec_on_message)
-    cec_config.SetSourceActivatedCallback(cec_on_source_activated)
+    cec_config.SetLogCallback(log_callback)
     client = cec.ICECAdapter.Create(cec_config)
     if not client.Open(config['cec']['port']):
         raise Exception("Could not connect to cec adapter")
 
-    addresses: cec.cec_logical_addresses = client.GetLogicalAddresses()
-    str_out = 'Addresses controlled by libCEC: '
-    i = 0
-    not_first = False
-    while i < 15:
-        if addresses.IsSet(i):
-            if not_first:
-                str_out += ', '
-            str_out += client.LogicalAddressToString(i)
-            if client.IsActiveSource(i):
-                str_out += ' (*)'
-            not_first = True
-        i += 1
-    print(str_out)
+    # addresses: cec.cec_logical_addresses = client.GetLogicalAddresses()
+    # str_out = 'Addresses controlled by libCEC: '
+    # i = 0
+    # not_first = False
+    # while i < 15:
+    #     if addresses.IsSet(i):
+    #         if not_first:
+    #             str_out += ', '
+    #         str_out += client.LogicalAddressToString(i)
+    #         if client.IsActiveSource(i):
+    #             str_out += ' (*)'
+    #         not_first = True
+    #     i += 1
+    # print(str_out)
+    time.sleep(2)
     return client
 
 
@@ -234,8 +254,8 @@ try:
         print('ERROR: Could not initialise CEC:', str(e))
         exit(1)
 
-    # print('Initializing MQTT...')
-    # mqtt_client = init_mqtt()
+    print('Initializing MQTT...')
+    mqtt_client = init_mqtt()
 
     print('Starting main loop...')
     while True:
